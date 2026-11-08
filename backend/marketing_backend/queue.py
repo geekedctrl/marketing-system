@@ -2,7 +2,7 @@ import secrets
 from datetime import timedelta
 from sqlalchemy import select, or_, and_, case, func, Integer
 from sqlalchemy.orm import aliased
-from .models import Job, Workspace, ExecutorOwnership, ProductLine, now
+from .models import Job, Workspace, ExecutorOwnership, ProductLine, ProviderUsage, now
 from .ownership import capability_for_job, active_python
 
 LEASE_SECONDS = 180
@@ -23,21 +23,34 @@ def recover_expired(db):
         )
     )
     for job in expired:
+        parallel_calls = list(db.scalars(select(ProviderUsage).where(
+            ProviderUsage.job_id == job.id, ProviderUsage.provider == "PARALLEL",
+            ProviderUsage.status.in_(("RESERVED", "UNCERTAIN", "SUCCESS"))
+        ).with_for_update()))
+        checkpoint = job.checkpoint or {}
+        unresolved = [usage for usage in parallel_calls if usage.status != "SUCCESS" or not any(
+            prefix + usage.operation in checkpoint for prefix in
+            ("parallel-search:", "parallel-model:", "parallel-identity:", "parallel-entity:")
+        )]
+        for usage in unresolved:
+            if usage.status == "RESERVED":
+                usage.status = "UNCERTAIN"
+        reason = "PARALLEL_RECONCILIATION_REQUIRED" if unresolved else "LEASE_EXPIRED"
         job.history = [
             *job.history,
             {
                 "attempt": job.attempts,
-                "code": "LEASE_EXPIRED",
+                "code": reason,
                 "at": instant.isoformat(),
             },
         ]
-        job.failure_code = "LEASE_EXPIRED"
-        job.status = "FAILED" if job.attempts >= job.max_attempts else "PENDING"
+        job.failure_code = reason
+        job.status = "FAILED" if unresolved or job.attempts >= job.max_attempts else "PENDING"
         job.available_at = instant + timedelta(seconds=min(300, 2**job.attempts))
         job.lease_token = job.lease_until = None
         from .worker_contracts import record
         record(db, job, "LEASE_LOSS", "LEASE_EXPIRED")
-        record(db, job, "FAILURE" if job.status == "FAILED" else "RETRY", "LEASE_EXPIRED")
+        record(db, job, "FAILURE" if job.status == "FAILED" else "RETRY", reason)
         if job.status == "FAILED":
             from .reassessment import resolve_reassessment
             resolve_reassessment(db, job, "REASSESSMENT_FAILED")
@@ -45,7 +58,7 @@ def recover_expired(db):
             from .models import PreparationRun
 
             run = db.get(PreparationRun, job.run_id)
-            run.status, run.stop_reason = "FAILED", "LEASE_EXPIRED"
+            run.status, run.stop_reason = "FAILED", reason
     db.commit()
     return len(expired)
 
@@ -174,6 +187,21 @@ def complete(db, job_id, token, result, review=False, duration_ms=None):
 
 def fail(db, job_id, token, code, retryable=False, duration_ms=None):
     job = owned(db, job_id, token)
+    # A failed call can still have reached Parallel. Do not let a normal
+    # manual or automatic retry duplicate an unresolved paid request.
+    usages = db.scalars(select(ProviderUsage).where(
+        ProviderUsage.job_id == job.id, ProviderUsage.provider == "PARALLEL",
+        ProviderUsage.status.in_(("RESERVED", "UNCERTAIN", "SUCCESS")),
+    ).with_for_update())
+    checkpoint = job.checkpoint or {}
+    for usage in usages:
+        if usage.status != "SUCCESS" or not any(
+            prefix + usage.operation in checkpoint for prefix in
+            ("parallel-search:", "parallel-model:", "parallel-identity:", "parallel-entity:")
+        ):
+            if usage.status == "RESERVED":
+                usage.status = "UNCERTAIN"
+            code, retryable = "PARALLEL_RECONCILIATION_REQUIRED", False
     job.history = [
         *job.history,
         {"attempt": job.attempts, "code": code, "at": now().isoformat()},

@@ -67,8 +67,8 @@ def bind_task(db, job):
         candidate_id=job.payload.get("source_candidate_id"),
         job_id=str(job.id), lead_id=str(job.lead_id) if job.lead_id else None,
         stage=job.kind, idempotency_key=job.idempotency_key, trace_id=str(job.trace_id),
-        contract_name=STAGE_CONTRACTS[job.kind], schema_version=3 if job.kind == "DISCOVERY" else 2,
-        producer_version="native.discovery.3" if job.kind == "DISCOVERY" else "native.day2.1",
+        contract_name=STAGE_CONTRACTS[job.kind], schema_version=4 if job.kind == "DISCOVERY" else 3 if job.kind == "CONTACT_SEARCH" else 2,
+        producer_version="native.discovery.4" if job.kind == "DISCOVERY" else "native.day2.1",
         context_version=line.context_version, context_hash=line.context_hash,
         input_hash=content_hash(job.payload), attempt=0, max_attempts=job.max_attempts, prior_artifacts=refs)
     validate_envelope(job.task_envelope)

@@ -205,7 +205,8 @@ class DiscoveryCandidate(Public):
     reasoning: str | None = None
     source_url: str | None = None
     evidence_quote: str | None = None
-    verification_state: Literal["CORROBORATED", "UNCERTAIN", "CONFLICTING"] | None = None
+    verification_state: Literal["CORROBORATED", "PROPOSED", "UNCERTAIN", "CONFLICTING"] | None = None
+    identity_proposal: dict | None = None
     ownership_reason: str | None = None
     ownership_evidence: list["OwnershipEvidence"] = Field(default_factory=list, max_length=2)
     unknowns: list[str] = Field(default_factory=list)
@@ -281,11 +282,31 @@ class ResearchResult(Public):
     stop_reason: str | None = None
 
 
+class SuggestionReview(Public):
+    decision: Literal["KEEP_FOR_REVIEW", "REJECTED", "UNRESOLVED"]
+    note: str
+    actor_id: UUID
+    at: datetime
+
+
+class ContactSuggestion(Public):
+    name: str
+    description: str
+    url: str
+    role: str | None = None
+    evidence: list[dict[str, str]] = Field(default_factory=list)
+    status: Literal["SUPPORTED", "UNVERIFIED"]
+    uncertainty: str
+    review: SuggestionReview | None = None
+    email_candidates: list[dict[str, str]] = Field(default_factory=list)
+
+
 class ContactResult(Public):
     people: list[ContactPerson]
     selected_contact: ContactPerson | None
     unavailable_queries: int
     stop_reason: str | None
+    suggestions: list[ContactSuggestion] = Field(default_factory=list)
 
 
 class ScoreResult(Public):

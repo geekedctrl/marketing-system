@@ -26,6 +26,9 @@ state.workspace.role='VIEWER';assert(!jobRetryState(j('FAILED')).allowed);assert
 state.workspace.role='ADMIN';state.data.operations.enabled=false;assert(!jobRetryState(j('FAILED')).allowed);
 state.data.operations.enabled=true;assert(!jobRetryState(j('FAILED',{attempts:3})).allowed);
 assert(!jobRetryState(j('NEEDS_REVIEW')).allowed);
+assert(!jobRetryState(j('FAILED',{failure_code:'PARALLEL_RECONCILIATION_REQUIRED'})).allowed);
+assert(!jobCards([j('FAILED',{failure_code:'PARALLEL_RECONCILIATION_REQUIRED'})]).includes('data-command='));
+assert(jobExplanation(j('FAILED',{failure_code:'PARALLEL_RECONCILIATION_REQUIRED'})).includes('uncertain'));
 assert(!jobCards([j('FAILED',{failure_code:'<img src=x onerror=alert(1)>',history:['<script>alert(1)</script>']})]).includes('<script>'));
 assert(!jobCards([j('FAILED',{failure_code:'<img src=x onerror=alert(1)>',history:['<script>alert(1)</script>']})]).includes('<img'));
 const discovery = jobCards([j('COMPLETED', {result:{counts:{candidates_ready:0, searches_attempted:3, websites_attempted:2, pages_attempted:2, assessments_attempted:1}, evaluated_domains:[{domain:'example.test',reason:'CANDIDATE_NOT_SUPPORTED',validation_details:[{field:'evidence',category:'UNKNOWN_EXCERPT'}]},{domain:'<img>',reason:'TIMEOUT'},{domain:'other.test',reason:'NO_MATCH'}]}})]);

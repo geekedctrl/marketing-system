@@ -34,7 +34,7 @@ NOW = "2026-10-11T10:00:00Z"
 class NativeFixture:
     def __init__(self):
         self.calls = []
-        self.candidates = {W1: [{"id":CID,"domain":"candidate.example.com","company_name":"Synthetic Candidate Logistics","website":"https://candidate.example.com/","status":"READY_FOR_REVIEW","industry":"Logistics","confidence":85,"icp_code":"ICP","reasoning":"Supported public transport services fit the customer segment.","source_url":"https://candidate.example.com/","evidence_quote":"Synthetic Candidate Logistics provides transport and freight services.","unknowns":["Buying intent unknown"],"stale":False,"accepted_lead_id":None}], W2: []}
+        self.candidates = {W1: [{"id":CID,"domain":"candidate.example.com","company_name":"Synthetic Candidate Logistics","website":"https://candidate.example.com/","status":"READY_FOR_REVIEW","verification_state":"CORROBORATED","industry":"Logistics","confidence":85,"icp_code":"ICP","reasoning":"Supported public transport services fit the customer segment.","source_url":"https://candidate.example.com/","evidence_quote":"Synthetic Candidate Logistics provides transport and freight services.","unknowns":["Buying intent unknown"],"stale":False,"accepted_lead_id":None}], W2: []}
         self.queries = []
         self.enabled = {W1: True, W2: True}
         self.catalog = {wid: [{"id": "catalog", "kind": "PRODUCT", "code": "OFFER", "name": name, "description": "Documented product capabilities", "rules": {}}, {"id": "icp", "kind": "ICP", "code": "ICP", "name": "Business customers", "description": "Source-backed business targeting", "rules": {}}] for wid, name in [(W1, "Fleet operations"), (W2, "Learning platform")]}
@@ -46,12 +46,14 @@ class NativeFixture:
         self.quote = "Morgan Lee Operations Director morgan@example.com"
         self.results = {
             "RESEARCH": {"facts": [{"category": "INDUSTRY", "statement": "Publicly documented logistics services", "source_url": "https://haulage.example.com/team", "evidence_quote": self.quote, "confidence": 85, "kind": "OBSERVED"}], "people": [], "unknowns": ["Fleet size is not established"], "pages": [{"source_url": "https://haulage.example.com/team", "text": self.quote}], "coverage": {"pages_attempted": 2, "unavailable_pages": 1}},
-            "CONTACT_SEARCH": {"people": [{"name": "Morgan Lee", "role": "Operations Director", "email": "morgan@example.com", "source_url": "https://haulage.example.com/team", "evidence_quote": self.quote, "profiles": [], "profile_candidates": [{"url": "https://www.linkedin.com/in/synthetic-morgan", "platform": "linkedin.com"}]}], "selected_contact": {"name": "Morgan Lee", "role": "Operations Director", "email": "morgan@example.com"}, "unavailable_queries": 2},
+            "CONTACT_SEARCH": {"people": [{"name": "Morgan Lee", "role": "Operations Director", "email": "morgan@example.com", "source_url": "https://haulage.example.com/team", "evidence_quote": self.quote, "profiles": [], "profile_candidates": [{"url": "https://www.linkedin.com/in/synthetic-morgan", "platform": "linkedin.com"}]}], "suggestions": [{"name": "Taylor Example", "role": "Fleet Director", "description": "Synthetic role", "url": "https://example.com/taylor", "status": "SUPPORTED", "uncertainty": "Review current role", "evidence": [{"source_url": "https://example.com/team", "evidence_quote": "Taylor Example is Fleet Director at Example Logistics."}]}], "selected_contact": {"name": "Morgan Lee", "role": "Operations Director", "email": "morgan@example.com"}, "unavailable_queries": 2},
             "SCORING": {"score": 75, "relevance": 60, "opportunity": 15, "criteria": [{"criterion": "ICP fit", "points": 40, "rationale": "Supported industry and business activity", "evidence": []}], "unknowns": [], "adjustments": []},
             "MATCHING": {"matches": [{"product_code": "OFFER", "fit": 80, "rationale": "Matches the documented catalog capabilities", "evidence": []}], "selected_product": "OFFER"},
             "DRAFTING": {"subject": "An exploratory conversation", "body": "Hello Morgan,\n\nYour company describes logistics services. Would a short conversation about your operations be relevant? <img src=x onerror=alert(1)>", "recipient": "morgan@example.com", "channel": "EMAIL", "product_code": "OFFER", "status": "PENDING_APPROVAL", "evidence": []},
         }
         self.job_status = "COMPLETED"
+        self.results["CONTACT_SEARCH"]["suggestions"][0]["email_candidates"] = [{"email": "taylor@example.com", "source_url": "https://example.com/team", "evidence_quote": "Taylor Example at Example Logistics: taylor@example.com", "observed_at": NOW, "status": "PUBLICLY_SOURCED_UNVERIFIED"}]
+        self.results["CONTACT_SEARCH"]["suggestions"].append({"name": "Alex Example", "role": None, "description": "Possible fleet lead", "url": "https://example.com/alex", "status": "UNVERIFIED", "uncertainty": "Confirm the current role", "evidence": []})
         self.fail_lead = False
         self.completed_results = copy.deepcopy(self.results)
         self.revision = None
@@ -212,8 +214,21 @@ class NativeFixture:
             self.results = {stage: value for stage,value in self.completed_results.items() if stage in {"RESEARCH","CONTACT_SEARCH"}}
             self.results["CONTACT_SEARCH"] = {**self.results["CONTACT_SEARCH"], "selected_contact": None}
             return httpx.Response(202, json={"run_id": RID})
+        if suffix.endswith("/suggestions/1/review"):
+            assert body == {"decision": "KEEP_FOR_REVIEW", "note": "Needs a current source.", "suggestion_name": "Alex Example", "suggestion_url": "https://example.com/alex"}
+            self.results["CONTACT_SEARCH"]["suggestions"][1]["review"] = {"decision": body["decision"], "note": body["note"], "actor_id": W1, "at": NOW}
+            return httpx.Response(202, json={"run_id": RID, "status": "NEEDS_REVIEW"})
         if suffix.endswith("/contact"):
-            assert set(body).issubset({"person_index", "profile_url", "business_contact"})
+            assert set(body).issubset({"person_index", "suggestion_index", "suggestion_name", "suggestion_url", "profile_url", "business_contact", "email_candidate_index", "email_candidate_value", "email_candidate_source"})
+            if "suggestion_index" in body:
+                if "email_candidate_index" in body:
+                    assert body == {"suggestion_index": 0, "suggestion_name": "Taylor Example", "suggestion_url": "https://example.com/taylor", "email_candidate_index": 0, "email_candidate_value": "taylor@example.com", "email_candidate_source": "https://example.com/team"}
+                    self.status = "PENDING_APPROVAL"
+                    self.results = copy.deepcopy(self.completed_results)
+                    return httpx.Response(202, json={"run_id": RID, "status": "PREPARING"})
+                assert body == {"suggestion_index": 0, "suggestion_name": "Taylor Example", "suggestion_url": "https://example.com/taylor"}
+                self.results["CONTACT_SEARCH"]["selected_contact"] = {"name": "Taylor Example", "role": "Fleet Director", "email": None}
+                return httpx.Response(202, json={"run_id": RID, "status": "NEEDS_REVIEW"})
             self.status = "PENDING_APPROVAL"
             self.results = copy.deepcopy(self.completed_results)
             return httpx.Response(202, json={"run_id": RID, "status": "PREPARING"})
@@ -415,7 +430,16 @@ def browser_acceptance():
             assert page.locator(".native-topbar h1").inner_text()=="Overview"
             assert page.get_by_role("heading",name="Recent leads",exact=True).count()==1
             assert page.get_by_role("heading",name="Pending approvals",exact=True).count()==1
+            assert page.get_by_role("progressbar", name="In progress: 0 of 1").get_attribute("value") == "0"
+            assert page.get_by_role("progressbar", name="Awaiting approval: 1 of 1").get_attribute("value") == "1"
             assert page.locator(".native-sidebar nav .ui-icon").count() >= 6
+            page.get_by_role("button",name="Collapse navigation").click()
+            assert page.get_by_role("button",name="Expand navigation").get_attribute("aria-expanded") == "false"
+            assert page.get_by_role("link",name="Discovery",exact=True).count() == 1
+            page.get_by_role("button",name="Expand navigation").click()
+            page.set_viewport_size({"width":780,"height":1000})
+            assert page.locator(".native-sidebar").bounding_box()["x"] < page.locator(".native-main").bounding_box()["x"]
+            page.set_viewport_size({"width":1440,"height":1000})
             page.screenshot(path=str(output/"overview-desktop.png"),full_page=True)
             page.set_viewport_size({"width":390,"height":844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"),"Overview overflows at mobile width"
@@ -443,10 +467,21 @@ def browser_acceptance():
             page.get_by_role("button", name="Sign out other sessions").click()
             page.get_by_role("link", name="Overview", exact=True).click()
             original_leads=len(fixture.leads[W1])
+            fixture.job_status="RUNNING"
             page.get_by_role("link",name="Discovery",exact=True).click()
             page.get_by_role("heading",name="Synthetic Candidate Logistics",exact=True).wait_for()
             assert len(fixture.leads[W1])==original_leads
             page.screenshot(path=str(output/"discovery-candidate-review.png"),full_page=True)
+            page.get_by_text("Review details & evidence", exact=False).click()
+            assert page.get_by_text("Synthetic Candidate Logistics provides transport and freight services.", exact=False).count() > 0
+            fixture.job_status="COMPLETED"
+            page.wait_for_timeout(11000)
+            assert page.locator("details.discovery-row-details").evaluate("element => element.open")
+            assert page.get_by_role("status").filter(has_text="Updates are available").is_visible()
+            page.get_by_text("Review details & evidence", exact=False).click()
+            page.locator("#content").focus()
+            page.locator("[data-refresh-pending]").wait_for(state="detached", timeout=15000)
+            page.get_by_text("Review details & evidence", exact=False).click()
             page.get_by_role("button",name="Accept & start research",exact=True).click()
             page.get_by_text("No candidates in this view.",exact=False).wait_for()
             assert len(fixture.leads[W1])==original_leads+1
@@ -485,8 +520,13 @@ def browser_acceptance():
             page.on("dialog",lambda dialog:dialog.accept())
             page.get_by_role("row").filter(has_text="Synthetic Haulage").get_by_role("button",name="Open lead",exact=True).click()
             page.locator(".lead-hero").get_by_role("heading",name="Synthetic Haulage <script>alert(1)</script>",exact=True).wait_for()
+            panel = page.get_by_role("tabpanel")
+            assert panel.get_attribute("tabindex") == "0"
+            assert panel.get_attribute("aria-labelledby") == page.get_by_role("tab", name="Overview", exact=True).get_attribute("id")
             assert page.get_by_role("navigation",name="Preparation stages").get_by_role("button").count()==5
             assert page.get_by_text("75/100",exact=True).count()==1
+            assert page.get_by_role("button",name="Review outreach draft",exact=True).is_visible()
+            assert not page.get_by_role("button",name="Start fresh preparation",exact=True).is_visible()
             page.screenshot(path=str(output/"lead-profile-desktop.png"),full_page=True)
             page.set_viewport_size({"width":390,"height":844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"),"Lead profile overflows at mobile width"
@@ -494,12 +534,25 @@ def browser_acceptance():
             page.set_viewport_size({"width":1440,"height":1000})
             page.get_by_role("navigation",name="Preparation stages").get_by_role("button",name="Qualification: Complete").click()
             assert page.get_by_role("tab",name="Qualification",exact=True).get_attribute("aria-selected")=="true"
+            page.get_by_text("Start a fresh preparation",exact=True).click()
             page.get_by_role("button",name="Start fresh preparation").click()
             page.get_by_role("tab",name="Qualification",exact=True).click()
             page.get_by_text("Qualification has not completed yet.",exact=True).wait_for()
             page.get_by_role("tab",name="People",exact=True).click()
             page.get_by_text("2 contact searches were unavailable.",exact=False).wait_for()
-            page.get_by_role("button",name="Choose this contact",exact=True).click()
+            page.get_by_text("Alex Example",exact=True).locator("xpath=ancestor::article[1]").get_by_text("Review suggestion",exact=True).click()
+            page.get_by_label("Review note",exact=True).fill("Needs a current source.")
+            page.get_by_role("button",name="Save review",exact=True).click()
+            page.get_by_text("Needs a current source.",exact=True).first.wait_for()
+            page.get_by_role("button",name="Select for review",exact=True).click()
+            page.get_by_text("Supported contact required",exact=False).first.wait_for()
+            page.get_by_role("tab",name="Overview",exact=True).click()
+            assert page.get_by_role("navigation",name="Preparation stages").get_by_role("button",name="Contact review: Needs review").is_visible()
+            page.get_by_role("tab",name="People",exact=True).click()
+            assert any(body == {"suggestion_index": 0, "suggestion_name": "Taylor Example", "suggestion_url": "https://example.com/taylor"} for _, path, body in fixture.calls if path.endswith("/contact"))
+            assert page.get_by_text("Publicly sourced, unverified",exact=False).is_visible()
+            page.get_by_role("button",name="Select this email for preparation",exact=True).click()
+            assert any(body.get("email_candidate_value") == "taylor@example.com" for _, path, body in fixture.calls if path.endswith("/contact"))
             page.get_by_role("tab",name="Outreach",exact=True).click();page.get_by_role("heading",name="An exploratory conversation").wait_for()
             assert page.locator("img").count()==0,"Draft HTML was rendered"
             page.screenshot(path=str(output/"lead-outreach-desktop.png"),full_page=True)
@@ -517,6 +570,7 @@ def browser_acceptance():
             page.get_by_role("row").filter(has_text="Synthetic Haulage").get_by_role("button",name="Open lead",exact=True).click()
             page.get_by_role("tab",name="Activity",exact=True).click();page.get_by_text("Historical",exact=False).wait_for()
             page.get_by_role("tab",name="Activity",exact=True).focus();page.keyboard.press("Home");assert page.get_by_role("tab",name="Overview",exact=True).get_attribute("aria-selected")=="true"
+            assert page.get_by_role("tab",name="Overview",exact=True).evaluate("element => element === document.activeElement")
             fixture.status="PENDING_APPROVAL";fixture.stale=True
             page.get_by_role("link",name="Approvals",exact=True).click();assert page.get_by_role("button",name="Approve draft",exact=True).is_disabled()
             page.locator("#organization").select_option(W2);page.locator(".native-topbar h1").get_by_text("Overview").wait_for();assert "Synthetic Haulage" not in page.locator("#view").inner_text()
@@ -529,7 +583,7 @@ def browser_acceptance():
             for width,height,name in [(1024,768,"tablet"),(390,844,"mobile")]:
                 page.set_viewport_size({"width":width,"height":height});page.screenshot(path=str(output/f"leads-{name}.png"),full_page=True)
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"),f"Page overflow at {width}"
-            page.get_by_role("button",name="Open navigation",exact=True).click();page.keyboard.press("Escape");assert not page.locator("#sidebar").is_visible()
+            page.get_by_role("button",name="Menu",exact=True).click();page.keyboard.press("Escape");assert not page.locator("#sidebar").is_visible()
             page.set_viewport_size({"width":1440,"height":1000})
             page.get_by_role("button",name="Theme:",exact=False).click();page.screenshot(path=str(output/"leads-theme.png"),full_page=True)
             page.get_by_role("button",name="Sign out",exact=True).click();page.get_by_role("heading",name="Welcome back").wait_for()

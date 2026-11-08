@@ -1,6 +1,7 @@
 """Offline contract tests: no engine, credentials, providers or network needed."""
 
 import copy
+import hashlib
 import json
 import unittest
 from uuid import uuid4
@@ -38,6 +39,18 @@ def envelope(stage="RESEARCH", version=2):
 
 
 class StageContractTests(unittest.TestCase):
+    def test_parallel_identity_v4_and_tampering(self):
+        item = candidate()
+        item.update(website="https://example.com/", domain="example.com", source_url="https://example.com/about")
+        item["verification_state"] = "PROPOSED"
+        item["identity_proposal"] = {"company_name": item["company_name"], "official_website": item["website"],
+            "assessment": "SUPPORTED", "reason": "Synthetic evidence", "sources": ["https://example.com/about"]}
+        signed = {key: item[key] for key in ("company_name", "website", "evidence_quote", "identity_proposal")}
+        item["identity_digest"] = hashlib.sha256(json.dumps(signed, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(validate_payload("discovery.candidate", 4, item)["verification_state"], "PROPOSED")
+        item["identity_proposal"]["sources"] = ["http://127.0.0.1/"]
+        self.assert_code("STAGE_PAYLOAD_INVALID", lambda: validate_payload("discovery.candidate", 4, item))
+
     def assert_code(self, code, call):
         with self.assertRaises(ContractViolation) as caught:
             call()

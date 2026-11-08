@@ -480,7 +480,7 @@ class StageArtifact(Base):
             ["jobs.workspace_id", "jobs.product_line_id", "jobs.id"],
         ),
         UniqueConstraint("job_id", "artifact_key"),
-        CheckConstraint("schema_version IN (1,2)"),
+        CheckConstraint("schema_version IN (1,2,3,4)"),
         Index("stage_artifact_line", "workspace_id", "product_line_id", "created_at"),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)

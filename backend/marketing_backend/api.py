@@ -20,6 +20,7 @@ from .models import (
     Catalog,
     Lead,
     Job,
+    ProviderUsage,
     now,
 )
 from .auth import user, scope, digest, verify_password, DUMMY
@@ -401,6 +402,17 @@ def retry(wid: UUID, jid: UUID, actor=Depends(user), db=Depends(session)):
         raise HTTPException(404, "Job not found")
     if item.status != "FAILED":
         raise HTTPException(409, "Only failed jobs can be retried")
+    usages = db.scalars(select(ProviderUsage).where(
+        ProviderUsage.workspace_id == wid, ProviderUsage.job_id == item.id,
+        ProviderUsage.provider == "PARALLEL", ProviderUsage.status.in_(("RESERVED", "UNCERTAIN", "SUCCESS")),
+    ))
+    checkpoint = item.checkpoint or {}
+    unresolved = any(usage.status != "SUCCESS" or not any(
+        prefix + usage.operation in checkpoint for prefix in
+        ("parallel-search:", "parallel-model:", "parallel-identity:", "parallel-entity:")
+    ) for usage in usages)
+    if item.failure_code == "PARALLEL_RECONCILIATION_REQUIRED" or unresolved:
+        raise HTTPException(409, "Reconcile the uncertain Parallel request before retrying")
     if item.lead_id:
         lead_for(db, wid, item.lead_id)
     if db.scalar(

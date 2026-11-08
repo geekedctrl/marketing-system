@@ -20,7 +20,10 @@ def scheduler_tick():
     # Independent transactions ensure one failed operation does not roll back
     # or starve all other recovery responsibilities.
     failed = False
-    for label,operation in (("job_recovery",recover_expired),("delivery_recovery",recover_deliveries),("discovery_schedule",schedule)):
+    operations = [("job_recovery", recover_expired)]
+    if os.getenv("SCHEDULER_RECOVERY_ONLY", "false").lower() != "true":
+        operations.extend((("delivery_recovery", recover_deliveries), ("discovery_schedule", schedule)))
+    for label,operation in operations:
         try:
             with Session() as db:
                 operation(db)

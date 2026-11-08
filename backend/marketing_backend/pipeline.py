@@ -216,7 +216,7 @@ def finalize(db, job, result):
 
         for item in [*result["candidates"], *result.get("evaluated_domains", [])]:
             from .domain_corroboration import valid_saved_evidence
-            verified = item.get("verification_state") == "CORROBORATED" and valid_saved_evidence(item)
+            verified = item.get("verification_state") in {"CORROBORATED", "PROPOSED"} and valid_saved_evidence(item)
             host = item.get("domain") or domain(item["website"])
             memory = db.scalar(
                 select(DiscoveryMemory)

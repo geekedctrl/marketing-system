@@ -757,12 +757,33 @@ def discover(job, providers):
             )
             continue
 
-        if (candidate and job.payload.get("official_search_name") and
+        if (candidate and isinstance(job.task_envelope, dict) and job.task_envelope.get("schema_version") in (1, 2, 3) and job.payload.get("official_search_name") and
                 normalize(candidate["company_name"]).casefold() != normalize(job.payload["official_search_name"]).casefold()):
             evaluated.append({"domain": host, "source_url": origin, "reason": "COMPANY_IDENTITY_MISMATCH"})
             continue
 
         if candidate:
+            if job.task_envelope is None or (isinstance(job.task_envelope, dict) and job.task_envelope.get("schema_version") == 4):
+                from .domain_corroboration import valid_parallel_proposal
+                import hashlib, json
+                try:
+                    proposal = providers.parallel_resolve_identity("identity:" + host, candidate["company_name"], candidate["website"])
+                except ProviderFailure as exc:
+                    if exc.code not in {"IDENTITY_OUTPUT_INVALID", "IDENTITY_PROVIDER_UNAVAILABLE", "IDENTITY_TRANSPORT_UNCERTAIN"}:
+                        raise
+                    evaluated.append({**{key: candidate[key] for key in ("company_name", "website", "industry", "prospect_type", "confidence", "icp_code", "reasoning", "evidence_quote", "unknowns")}, "domain": host, "source_url": candidate["source_url"], "reason": exc.code, "verification_state": "UNCERTAIN"})
+                    continue
+                candidate["verification_state"] = "PROPOSED"
+                candidate["identity_proposal"] = proposal
+                digest_input = {"company_name": candidate["company_name"], "website": candidate["website"], "evidence_quote": candidate["evidence_quote"], "identity_proposal": proposal}
+                candidate["identity_digest"] = hashlib.sha256(json.dumps(digest_input, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+                if valid_parallel_proposal(candidate):
+                    candidates.append(candidate)
+                else:
+                    evaluated.append({**{key: candidate[key] for key in ("company_name", "website", "industry", "prospect_type", "confidence", "icp_code", "reasoning", "evidence_quote", "unknowns")}, "domain": host, "source_url": candidate["source_url"], "reason": "OFFICIAL_SITE_UNCERTAIN", "verification_state": "UNCERTAIN", "identity_proposal": proposal})
+                if len(candidates) >= target:
+                    break
+                continue
             ownership = corroborate(
                 candidate["company_name"], candidate["website"],
                 candidate["evidence_quote"], providers,

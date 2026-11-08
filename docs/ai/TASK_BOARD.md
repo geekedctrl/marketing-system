@@ -116,3 +116,10 @@ Release checkpoint: implementation commit `bec7684`, integrated latest develop `
 | N-05 Native runtime alongside legacy DEV | Deployed to DEV; DietPi deploy helper updated and preflight passes | Keep legacy/n8n and production available until native research-through-approval acceptance passes. Finish real research/contact/scoring/draft validation and pending human approval. |
 
 N-05 verification update - 14 October 2026: after the research reliability fix merged, the live worker image was found stale because the DietPi helper only rebuilt the legacy API/dashboard. The installed helper now starts and waits for both databases, backs up both databases before migrations, builds the native API/worker/dashboard, runs the native migration, starts native services, verifies worker/API/dashboard health and both Alembic heads, and reports native logs on failure. Feature deployments cannot modify native Compose or Docker build files. bash -n and lorry-dev-deploy check develop pass. No live application deployment was triggered by this helper-only update.
+
+## Contact discovery follow-up — 4 November 2026
+
+| Scope | State |
+| --- | --- |
+| Matching, evidence, recovery and local Compose integration | Implemented and synthetically verified; local services running |
+| Pos Logistics updated matching and provider-account billing | Pending live retry and account-admin usage access |

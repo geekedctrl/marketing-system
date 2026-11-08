@@ -23,6 +23,7 @@ REVIEW_ROLES = ["ADMIN", "OPERATOR", "REVIEWER"]
 class Review(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     note: str = Field(default="", max_length=1000)
+    acknowledge_uncertainty: bool = False
 
 
 def candidate_for(db, wid, cid):
@@ -52,6 +53,7 @@ def public(row, current_hash):
             "verification_state",
             "ownership_reason",
             "ownership_evidence",
+            "identity_proposal",
         )
     }
     return {
@@ -151,6 +153,8 @@ def accept(
             409, "Targeting changed. Reassess this candidate before acceptance"
         )
     value = row.candidate
+    if value.get("verification_state") == "PROPOSED" and value.get("identity_proposal", {}).get("assessment") in {"UNCERTAIN", "CONFLICTING"} and not data.acknowledge_uncertainty:
+        raise HTTPException(409, "Acknowledge identity uncertainty before accepting")
     if not valid_saved_evidence(value):
         raise HTTPException(409, "Official website evidence is missing, changed, or unverified. Reassess this candidate before acceptance")
     try:
@@ -173,7 +177,7 @@ def accept(
         raise HTTPException(409, "Active catalog and targeting are required") from None
     row.outcome = "ACCEPTED"
     row.accepted_lead_id = lead.id
-    row.reviewed_by, row.reviewed_at, row.review_note = actor.id, now(), data.note
+    row.reviewed_by, row.reviewed_at, row.review_note = actor.id, now(), ("[Identity uncertainty acknowledged] " if data.acknowledge_uncertainty else "") + data.note
     db.commit()
     return {
         "candidate_id": row.id,

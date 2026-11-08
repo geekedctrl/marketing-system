@@ -142,11 +142,37 @@ class ProductLineTests(BackendFixtures):
         for lid in (self.a,self.b):
             page=self.client.get(f"/workspaces/{self.wid}/candidates?product_line_id={lid}",headers=self.headers).json()
             self.assertEqual(len(page["items"]),1)
+            self.assertEqual(page["items"][0]["verification_state"], "PROPOSED")
+            self.assertEqual(page["items"][0]["identity_proposal"]["sources"], ["https://example.com/about"])
             cid=page["items"][0]["id"]
             accepted=self.client.post(f"/workspaces/{self.wid}/candidates/{cid}/accept",headers=self.headers,json={})
             self.assertEqual(accepted.status_code,200,accepted.text)
             self.assertEqual(accepted.json()["lead_id"],str(self.lid))
         with Session() as db:self.assertEqual(db.scalar(select(func.count()).select_from(Lead)),1)
+
+    def test_uncertain_identity_requires_acknowledgement(self):
+        response = self.client.post(f"{self.prefix}/{self.a}/discovery", headers=self.headers, json=dict(idempotency_key="uncertain-identity-test"))
+        self.assertEqual(response.status_code, 202, response.text)
+        def uncertain(provider, operation, company_name, website):
+            return {"company_name": company_name, "official_website": website, "assessment": "UNCERTAIN", "reason": "Synthetic uncertainty", "sources": ["https://example.com/about"]}
+        with patch.object(FixtureProviders, "parallel_resolve_identity", uncertain):
+            self.drain()
+        items = self.client.get(f"/workspaces/{self.wid}/candidates?product_line_id={self.a}", headers=self.headers).json()["items"]
+        self.assertEqual(items[0]["identity_proposal"]["assessment"], "UNCERTAIN")
+        path = f"/workspaces/{self.wid}/candidates/{items[0]['id']}/accept"
+        self.assertEqual(self.client.post(path, headers=self.headers, json={}).status_code, 409)
+        self.assertEqual(self.client.post(path, headers=self.headers, json={"acknowledge_uncertainty": True}).status_code, 200)
+
+    def test_identity_failure_is_contained_to_company(self):
+        response = self.client.post(f"{self.prefix}/{self.a}/discovery", headers=self.headers, json=dict(idempotency_key="invalid-identity-test"))
+        self.assertEqual(response.status_code, 202, response.text)
+        with patch.object(FixtureProviders, "parallel_resolve_identity", side_effect=ProviderFailure("IDENTITY_OUTPUT_INVALID")):
+            self.drain()
+        with Session() as db:
+            job = db.get(Job, UUID(response.json()["job_id"]))
+            self.assertEqual(job.status, "COMPLETED")
+            self.assertEqual(job.result["outcome"], "PARTIAL_FAILURE")
+            self.assertEqual(job.result["evaluated_domains"][0]["reason"], "IDENTITY_OUTPUT_INVALID")
 
     def test_approval_for_one_line_is_not_superseded_by_another_line(self):
         ra=self.prepare_line(self.a);rb=self.prepare_line(self.b);self.drain()
@@ -186,6 +212,47 @@ class ProductLineTests(BackendFixtures):
             self.assertEqual(db.get(StageArtifact,old_id).payload,old_value)
             self.assertEqual(db.get(PreparationRun,rid).status,"PENDING_APPROVAL")
             self.assertEqual(db.scalar(select(func.count()).select_from(StageArtifact).where(StageArtifact.job_id==contact.id)),2)
+
+    def test_unverified_suggestion_review_is_an_immutable_artifact(self):
+        FixtureProviders.people = False
+        rid = self.prepare_line(self.a)
+        with patch.object(FixtureProviders, "parallel_entity_search", return_value=[{"name": "Morgan Lee", "url": "https://example.com/morgan", "description": "Possible fleet lead"}]):
+            self.drain()
+        with Session() as db:
+            contact = db.scalar(select(Job).where(Job.run_id == rid, Job.kind == "CONTACT_SEARCH"))
+            original = db.scalar(select(StageArtifact).where(StageArtifact.job_id == contact.id))
+            original_id, original_payload = original.id, original.payload
+        response = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/suggestions/0/review", headers=self.headers,
+                                    json={"decision": "KEEP_FOR_REVIEW", "note": "Confirm their current role.", "suggestion_name": "Morgan Lee", "suggestion_url": "https://example.com/morgan"})
+        self.assertEqual(response.status_code, 202, response.text)
+        with Session() as db:
+            self.assertEqual(db.get(StageArtifact, original_id).payload, original_payload)
+            artifacts = list(db.scalars(select(StageArtifact).where(StageArtifact.job_id == contact.id).order_by(StageArtifact.created_at)))
+            self.assertEqual(len(artifacts), 2)
+            self.assertEqual(artifacts[-1].payload["suggestions"][0]["review"]["decision"], "KEEP_FOR_REVIEW")
+            self.assertEqual(db.get(PreparationRun, rid).status, "NEEDS_REVIEW")
+
+    def test_public_email_selection_preserves_evidence_in_new_artifact(self):
+        FixtureProviders.people = False
+        rid = self.prepare_line(self.a)
+        original_search = FixtureProviders.search
+        def search(provider, operation, query, **options):
+            if operation.startswith("contact-evidence-"):
+                return [{"url": "https://example.com/team", "text": "Morgan Lee is Operations Director at Example Logistics. Email morgan@example.com."}]
+            return original_search(provider, operation, query, **options)
+        with patch.object(FixtureProviders, "parallel_entity_search", return_value=[{"name": "Morgan Lee", "url": "https://example.com/morgan", "description": "Title: Operations Director"}]), patch.object(FixtureProviders, "search", search):
+            self.drain()
+        body = {"suggestion_index": 0, "suggestion_name": "Morgan Lee", "suggestion_url": "https://example.com/morgan", "email_candidate_index": 0, "email_candidate_value": "morgan@example.com", "email_candidate_source": "https://example.com/team"}
+        response = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/contact", headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 202, response.text)
+        with Session() as db:
+            contact = db.scalar(select(Job).where(Job.run_id == rid, Job.kind == "CONTACT_SEARCH"))
+            artifacts = list(db.scalars(select(StageArtifact).where(StageArtifact.job_id == contact.id).order_by(StageArtifact.created_at)))
+            self.assertEqual(len(artifacts), 2)
+            candidate = artifacts[-1].payload["suggestions"][0]["email_candidates"][0]
+            self.assertEqual(candidate["email"], "morgan@example.com")
+            self.assertEqual(candidate["status"], "PUBLICLY_SOURCED_UNVERIFIED")
+            self.assertEqual(artifacts[-1].payload["selected_contact"]["email"], candidate["email"])
 
     def test_line_budget_and_rate_controls_preserve_global_ceiling(self):
         response=self.client.patch(f"{self.prefix}/{self.a}",headers=self.headers,json=dict(limits=dict(monthly_budget_microusd=1)))

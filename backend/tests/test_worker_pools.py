@@ -61,6 +61,25 @@ class WorkerPoolTests(BackendFixtures):
             self.assertEqual(job.status,"PENDING")
             with self.assertRaises(queue.LeaseLost):queue.complete(db,job.id,token,{})
 
+    def test_expired_parallel_request_requires_reconciliation(self):
+        ids = self.make_jobs()
+        with Session() as db:
+            job = queue.claim(db, pool="DISCOVERY")
+            job.lease_until = now() - timedelta(seconds=1)
+            db.add(ProviderUsage(workspace_id=self.wid, product_line_id=job.product_line_id,
+                job_id=job.id, provider="PARALLEL", operation="identity:example.com",
+                estimated_microusd=10000, status="RESERVED"))
+            db.commit()
+        with Session() as db:
+            queue.recover_expired(db)
+        with Session() as db:
+            job = db.get(Job, ids["DISCOVERY"])
+            usage = db.scalar(select(ProviderUsage).where(ProviderUsage.job_id == job.id))
+            self.assertEqual((job.status, job.failure_code), ("FAILED", "PARALLEL_RECONCILIATION_REQUIRED"))
+            self.assertEqual((usage.status, usage.estimated_microusd), ("UNCERTAIN", 10000))
+        response = self.client.post(f"/workspaces/{self.wid}/jobs/{ids['DISCOVERY']}/retry", headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+
     def test_concurrent_process_claims_do_not_duplicate_job_ownership(self):
         ids=self.make_jobs()
         def claim():

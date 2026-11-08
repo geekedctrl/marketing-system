@@ -331,25 +331,14 @@ class BackendTests(BackendFixtures):
         }
         response = httpx.Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {
-                            "content": __import__("json").dumps(
-                                {"facts": [fact], "unknowns": ["Fleet size unknown"]}
-                            )
-                        },
-                    }
-                ]
-            },
+            json={"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": __import__("json").dumps({"facts": [fact], "unknowns": ["Fleet size unknown"]})}]}]},
         )
         with patch.dict(
             os.environ,
             {
-                "MODEL_API_KEY": "fixture-only",
-                "MODEL_INPUT_USD_PER_MILLION": "1",
-                "MODEL_OUTPUT_USD_PER_MILLION": "1",
+                "PARALLEL_API_KEY": "fixture-only",
+                "PARALLEL_RESPONSE_USD_PER_REQUEST": "0.01",
+                "PARALLEL_MONTHLY_BUDGET_USD": "32",
             },
         ), patch(
             "marketing_backend.research.fetch_public",

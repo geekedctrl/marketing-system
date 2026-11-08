@@ -15,6 +15,8 @@ def contact_resolution(db,job,run,actor_id,value):
         raise HTTPException(409,"Contact resolution is not pending")
     parsed=validate_task(db,job)
     if parsed is None:return
+    if parsed.schema_version < 3:
+        value={key:item for key,item in value.items() if key != "suggestions"}
     value=validate_payload("contact.output",parsed.schema_version,value)
     digest=content_hash(value);key="result:human:"+digest
     if db.scalar(select(StageArtifact.id).where(StageArtifact.job_id==job.id,StageArtifact.artifact_key==key)):

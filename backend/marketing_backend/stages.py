@@ -2,6 +2,7 @@
 """Shared, product-driven native preparation handlers. No approval or sending handler."""
 
 import re
+import hashlib
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
@@ -399,10 +400,124 @@ def company_tokens(name):
     ]
 
 
+def discover_people(job, providers, research=None, search_state=None):
+    """Find possible people and independently inspect public excerpts for support."""
+    from .contact_evidence import support_for_person, extract_official_people, role_priority, public_email_candidates
+    from datetime import datetime, timezone
+    company = job.payload["company_name"]
+    website = job.payload.get("website", "")
+    country = job.payload.get("context", {}).get("preferences", {}).get("country", "")
+    location = {"MY": "Malaysia", "SG": "Singapore", "ID": "Indonesia"}.get(country, country)
+    search_state = search_state if search_state is not None else {"blocked": False, "unavailable": 0}
+    try:
+        candidates = providers.parallel_entity_search(
+            "contact-entities-v2", f"People working at {company} ({website}) in {location}, especially operations, fleet and logistics leaders", count=10
+        )
+    except ProviderFailure as exc:
+        if exc.code != "SEARCH_UNAVAILABLE" or not exc.retryable:
+            raise
+        search_state.update(blocked=True, unavailable=1)
+        candidates = []
+    def rank(candidate):
+        description = candidate["description"].casefold()
+        score = 0
+        if domain(website) and domain(website) in description:
+            score += 8
+        if location and location.casefold() in description:
+            score += 4
+        if country == "MY" and re.search(r"\b(indonesia|singapore|canada)\b", description) and "malaysia" not in description:
+            score -= 5
+        if re.search(r"\b(operations|fleet|logistics|transport|director|manager)\b", description):
+            score += 1
+        return -score
+    candidates = sorted(candidates, key=rank)[:5]
+    sources = []
+    for index, candidate in enumerate(candidates):
+        identity = hashlib.sha256((candidate["name"] + "\0" + candidate["url"]).encode()).hexdigest()[:16]
+        generation = getattr(job, "output_generation", 0) or 0
+        rows = contact_search(providers, search_state, f"contact-evidence-v3-g{generation}-{identity}", f'"{candidate["name"]}" "{company}" "{domain(website)}" {location} role operations fleet logistics public business email')
+        sources.append(rows)
+    suggestions = []
+    for index, candidate in enumerate(candidates):
+        name = candidate["name"][:150]
+        if len(name.strip()) < 3:
+            continue
+        match = re.search(r"(?:^|\|)\s*Title:\s*([^|]{3,200})", candidate["description"], re.I)
+        role = match.group(1).strip() if match else ""
+        evidence = support_for_person(name, role, company, sources[index], website=website, profile_url=candidate["url"]) if domain(website) else []
+        source_excerpts = [{"source_url": row["url"], "evidence_quote": normalize(row["text"])[:500]}
+                           for row in sources[index] if len(normalize(row.get("text", ""))) >= 8][:5]
+        ended = bool(re.search(r"\b20\d{2}-\d{2}-\d{2}\s+20\d{2}-\d{2}-\d{2}\b", candidate["description"]))
+        email_candidates = public_email_candidates(name, company, sources[index], datetime.now(timezone.utc).isoformat())
+        suggestions.append({"name": name, "description": candidate["description"], "url": candidate["url"],
+                            "role": role if evidence else None, "evidence": evidence or source_excerpts,
+                            "email_candidates": email_candidates,
+                            "status": "SUPPORTED" if evidence else "UNVERIFIED",
+                            "uncertainty": "Public evidence needs human review; current employment is not confirmed." if evidence else
+                            "Some listed roles have end dates; confirm the current role and company." if ended else
+                            "No source excerpt establishes this person's role and company relationship."})
+    research_rows = [{"url": page.get("source_url", ""), "text": page.get("text", "")}
+                     for page in (research or {}).get("pages", []) if isinstance(page, dict)]
+    public_rows = research_rows + [row for group in sources for row in group]
+    for person in extract_official_people(public_rows, website, company):
+        evidence = person["evidence"]
+        item = {"name": person["name"], "description": person["description"], "url": person["url"],
+                "role": person["role"], "evidence": evidence or [{"source_url": person["url"], "evidence_quote": person["excerpt"]}], "status": "SUPPORTED" if evidence else "UNVERIFIED",
+                "uncertainty": "Listed on an official page; review the source and confirm the role is current." if evidence else "Role may be stale, conflicting or insufficiently sourced; confirm before use."}
+        existing = next((i for i, old in enumerate(suggestions) if old["name"].casefold() == person["name"].casefold()), None)
+        if existing is None:
+            suggestions.append(item)
+        elif person.get("conflicting") or evidence:
+            item["email_candidates"] = suggestions[existing].get("email_candidates", [])
+            suggestions[existing] = item
+    suggestions.sort(key=lambda item: (-role_priority(item.get("role") or item["description"]),
+                                       item["status"] != "SUPPORTED",
+                                       not item["description"].startswith("Name and role listed together")))
+    suggestions = suggestions[:5]
+    return suggestions, search_state["unavailable"]
+
+
+def contact_search(providers, state, operation, query):
+    """Stop further searches on a definite 429; uncertain calls must fail closed."""
+    if state["blocked"]:
+        return []
+    try:
+        return providers.search(operation, query)
+    except ProviderFailure as exc:
+        if exc.code != "SEARCH_UNAVAILABLE" or not exc.retryable:
+            raise
+        state.update(blocked=True, unavailable=min(10, state["unavailable"] + 1))
+        return []
+
+
 def contacts(job, providers):
     research = result(job, "RESEARCH")
     people = []
-    unavailable = 0
+    search_state = {"blocked": False, "unavailable": 0}
+    suggestions, _ = discover_people(job, providers, research, search_state)
+    if (getattr(job, "output_generation", 0) or 0) > 0:
+        from .contact_evidence import public_email_candidates
+        from datetime import datetime, timezone
+        try:
+            previous = result(job, "CONTACT_SEARCH")
+        except ProviderFailure as error:
+            if error.code != "MISSING_STAGE_INPUT":
+                raise
+            previous = {}
+        selected = previous.get("selected_contact") or {}
+        name = selected.get("name", "")
+        company = job.payload["company_name"]
+        target = next((s for s in suggestions if s["name"].casefold() == name.casefold()), None) if isinstance(name, str) else None
+        if not target and isinstance(name, str):
+            saved = next((s for s in previous.get("suggestions", []) if s.get("name", "").casefold() == name.casefold() and s.get("status") == "SUPPORTED"), None)
+            if saved:
+                target = dict(saved)
+                suggestions = [target, *suggestions[:4]]
+        if target and target["status"] == "SUPPORTED":
+            identity = hashlib.sha256(name.casefold().encode()).hexdigest()[:16]
+            generation = job.output_generation
+            rows = contact_search(providers, search_state, f"contact-selected-email-v1-g{generation}-{identity}", f'"{name}" "{company}" email business contact')
+            target["email_candidates"] = public_email_candidates(name, company, rows, datetime.now(timezone.utc).isoformat())
     for index, original in enumerate(research["people"]):
         person = {**original, "profiles": [], "profile_candidates": []}
         for label, query in [
@@ -415,13 +530,7 @@ def contacts(job, providers):
                 f'"{person["name"]}" "{job.payload["company_name"]}" "{person["role"]}" (site:x.com OR site:github.com OR site:instagram.com)',
             ),
         ]:
-            try:
-                rows = providers.search(f"person-{index}-{label}", query)
-            except ProviderFailure as exc:
-                if exc.code not in ("SEARCH_UNAVAILABLE", "SEARCH_TRANSPORT_ERROR"):
-                    raise
-                unavailable += 1
-                continue
+            rows = contact_search(providers, search_state, f"person-{index}-{label}", query)
             found = {}
             for row in rows:
                 title = normalize(row["title"]).lower()
@@ -481,14 +590,15 @@ def contacts(job, providers):
     )
     return {
         "people": people,
+        "suggestions": suggestions,
         "selected_contact": chosen,
-        "unavailable_queries": unavailable,
+        "unavailable_queries": search_state["unavailable"],
         "stop_reason": (
             None
             if chosen
             else (
                 "CONTACT_SEARCH_UNAVAILABLE"
-                if unavailable
+                if search_state["unavailable"]
                 else "SUPPORTED_CONTACT_REQUIRED"
             )
         ),

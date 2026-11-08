@@ -98,3 +98,11 @@ Implementation branch: geekedctrl/native-dev-cutover. Native API, worker, isolat
 ## Native deployment helper update - 14 October 2026
 
 The deployed PR #43 research fix was missing from the running worker image because the installed DietPi helper only rebuilt the legacy API and dashboard. The persistent `/usr/local/sbin/lorry-dev-deploy` helper has now been updated to start both databases, back up both before migrations, build the native API/worker/dashboard, apply the native migration, start the native services, and verify worker process, API/dashboard health, and migration heads. It logs native services on failure and protects native Compose/Docker files from direct feature-branch deploys. `bash -n` and its read-only `check develop` preflight pass at `187c0ce`. A timestamped pre-change backup is stored at `/opt/lorrysystem/ops/lorry-dev-deploy.backup-20261014`. This helper update did not deploy application code or change production.
+
+## Contact discovery follow-up — 4 November 2026
+
+Implemented matching, source identity checks and fail-closed request recovery on `feature/parallel-contact-discovery`; the local Compose API, dashboard and contact worker are rebuilt from that checkout. Synthetic backend/BFF/browser verification passed. Pos Logistics retains its earlier five unverified suggestions; updated live matching and actual account billing are not yet verified. See HANDOFF.md.
+
+Pos Logistics revised matching was retried locally after user sign-in: five suggestions, one source-supported, four unverified; no contact selected or outreach sent. The saved leadership excerpt also names an operations head outside the returned suggestion set. Billing was not investigated at user request.
+
+Official-page contact extraction is implemented and locally checked against Pos Logistics saved evidence; the operations lead is now first in review. The full dirty-worktree Orca review remains incomplete, so the branch is not merge-ready. See HANDOFF.md.

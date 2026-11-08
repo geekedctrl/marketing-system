@@ -88,6 +88,19 @@ class SyntheticProviders(Providers):
     def ready(self, search=False):
         guard()
 
+    def parallel_entity_search(self, operation, objective, *, count=10):
+        guard()
+        return []
+
+    def parallel_resolve_identity(self, operation, company_name, website):
+        guard()
+        from urllib.parse import urlsplit
+        if not (urlsplit(website).hostname or "").endswith(".fixtures.example.org"):
+            raise RuntimeError("Synthetic identity requires a fixture domain")
+        return {"assessment": "SUPPORTED", "company_name": company_name,
+                "official_website": website, "reason": "Synthetic identity fixture",
+                "sources": [website]}
+
     def search(self, operation, query, **options):
         key = "search:" + operation
         if key in self.cache:

@@ -59,6 +59,9 @@ class FixtureProviders:
     def ready(self, search=False):
         pass
 
+    def parallel_entity_search(self, operation, objective, *, count=10):
+        return []
+
     def remember(self, key, value):
         self.cache[key] = value
         self.save(self.cache)
@@ -79,6 +82,11 @@ class FixtureProviders:
                 for n in (1, 2)
             ]
         return []
+
+    def parallel_resolve_identity(self, operation, company_name, website):
+        return {"company_name": company_name, "official_website": website,
+                "assessment": "SUPPORTED", "reason": "Synthetic cited identity proposal",
+                "sources": ["https://example.com/about"]}
 
     def model(self, operation, instructions, data):
         if operation == "setup":
@@ -401,6 +409,107 @@ class NativeTests(BackendFixtures):
                 db.get(PreparationRun, rid).stop_reason, "SUPPORTED_CONTACT_REQUIRED"
             )
             self.assertEqual(list(db.scalars(select(Approval))), [])
+
+    def test_supported_discovery_requires_selection_and_no_channel_stays_in_review(self):
+        class ContactSuggestions(FixtureProviders):
+            people = False
+
+            def parallel_entity_search(self, operation, objective, *, count=10):
+                return [{"name": "Morgan Lee", "url": "https://example.com/morgan", "description": "Title: Operations Director"}]
+
+            def search(self, operation, query, **options):
+                if operation.startswith("contact-evidence-"):
+                    return [{"url": "https://example.com/team", "title": "Team", "text": "Morgan Lee is Operations Director at Example Logistics."}]
+                return super().search(operation, query, **options)
+
+            def model(self, operation, instructions, data):
+                if operation == "contact-roles":
+                    return {"people": [{"index": 0, "role": "Operations Director"}]}
+                return super().model(operation, instructions, data)
+
+        rid = self.prepare("suggestions")
+        with patch("marketing_backend.stages.Providers", ContactSuggestions):
+            self.assertEqual(self.drain(), ["RESEARCH", "CONTACT_SEARCH"])
+        with Session() as db:
+            run = db.get(PreparationRun, rid)
+            self.assertIsNone(run.results["CONTACT_SEARCH"]["selected_contact"])
+            self.assertEqual(run.results["CONTACT_SEARCH"]["suggestions"][0]["status"], "SUPPORTED")
+        viewer = {"Authorization": "Bearer " + self.login("viewer@example.test")}
+        forbidden = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/contact", headers=viewer, json={"suggestion_index": 0})
+        self.assertEqual(forbidden.status_code, 403)
+        isolated = self.client.post(f"/workspaces/{self.other}/preparation/{rid}/contact", headers=self.headers, json={"suggestion_index": 0})
+        self.assertIn(isolated.status_code, (403, 404))
+        choice = {"suggestion_index": 0, "suggestion_name": "Morgan Lee", "suggestion_url": "https://example.com/morgan"}
+        stale = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/contact", headers=self.headers, json={**choice, "suggestion_name": "Other Person"})
+        self.assertEqual(stale.status_code, 409)
+        response = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/contact", headers=self.headers, json=choice)
+        self.assertEqual(response.status_code, 202, response.text)
+        with Session() as db:
+            run = db.get(PreparationRun, rid)
+            self.assertEqual(run.status, "NEEDS_REVIEW")
+            self.assertIsNone(run.results["CONTACT_SEARCH"]["selected_contact"]["email"])
+            self.assertEqual(list(db.scalars(select(Approval))), [])
+
+    def test_public_email_requires_explicit_current_selection_and_operator(self):
+        class ContactSuggestions(FixtureProviders):
+            people = False
+            def parallel_entity_search(self, operation, objective, *, count=10):
+                return [{"name": "Morgan Lee", "url": "https://example.com/morgan", "description": "Title: Operations Director"}]
+            def search(self, operation, query, **options):
+                if operation.startswith("contact-evidence-"):
+                    return [{"url": "https://example.com/team", "title": "Team", "text": "Morgan Lee is Operations Director at Example Logistics. Email morgan@example.com."}]
+                return super().search(operation, query, **options)
+
+        rid = self.prepare("public-email-review")
+        with patch("marketing_backend.stages.Providers", ContactSuggestions):
+            self.assertEqual(self.drain(), ["RESEARCH", "CONTACT_SEARCH"])
+        with Session() as db:
+            saved = db.get(PreparationRun, rid).results["CONTACT_SEARCH"]
+            self.assertIsNone(saved["selected_contact"])
+            self.assertEqual(saved["suggestions"][0]["email_candidates"][0]["status"], "PUBLICLY_SOURCED_UNVERIFIED")
+        url = f"/workspaces/{self.wid}/preparation/{rid}/contact"
+        body = {"suggestion_index": 0, "suggestion_name": "Morgan Lee", "suggestion_url": "https://example.com/morgan", "email_candidate_index": 0, "email_candidate_value": "morgan@example.com", "email_candidate_source": "https://example.com/team"}
+        viewer = {"Authorization": "Bearer " + self.login("viewer@example.test")}
+        self.assertEqual(self.client.post(url, headers=viewer, json=body).status_code, 403)
+        self.assertEqual(self.client.post(url, headers=self.headers, json={**body, "email_candidate_value": "other@example.com"}).status_code, 409)
+        self.assertIn(self.client.post(f"/workspaces/{self.other}/preparation/{rid}/contact", headers=self.headers, json=body).status_code, (403, 404))
+        response = self.client.post(url, headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 202, response.text)
+        with Session() as db:
+            run = db.get(PreparationRun, rid)
+            self.assertEqual(run.results["CONTACT_SEARCH"]["selected_contact"]["email"], "morgan@example.com")
+            self.assertEqual(run.status, "PREPARING")
+            self.assertEqual(list(db.scalars(select(Approval))), [])
+
+    def test_operator_review_of_unverified_suggestion_keeps_outreach_stopped(self):
+        class UnverifiedSuggestion(FixtureProviders):
+            people = False
+            def parallel_entity_search(self, operation, objective, *, count=10):
+                return [{"name": "Morgan Lee", "url": "https://example.com/morgan", "description": "Possible operations lead"}]
+
+        rid = self.prepare("unverified-review")
+        with patch("marketing_backend.stages.Providers", UnverifiedSuggestion):
+            self.assertEqual(self.drain(), ["RESEARCH", "CONTACT_SEARCH"])
+        url = f"/workspaces/{self.wid}/preparation/{rid}/suggestions/0/review"
+        body = {"decision": "KEEP_FOR_REVIEW", "note": "Role needs a current source.", "suggestion_name": "Morgan Lee", "suggestion_url": "https://example.com/morgan"}
+        viewer = {"Authorization": "Bearer " + self.login("viewer@example.test")}
+        self.assertEqual(self.client.post(url, headers=viewer, json=body).status_code, 403)
+        self.assertIn(self.client.post(f"/workspaces/{self.other}/preparation/{rid}/suggestions/0/review", headers=self.headers, json=body).status_code, (403, 404))
+        self.assertEqual(self.client.post(url, headers=self.headers, json={**body, "suggestion_name": "Other Person"}).status_code, 409)
+        response = self.client.post(url, headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 202, response.text)
+        with Session() as db:
+            run = db.get(PreparationRun, rid)
+            suggestion = run.results["CONTACT_SEARCH"]["suggestions"][0]
+            self.assertEqual(suggestion["status"], "UNVERIFIED")
+            self.assertEqual(suggestion["review"]["decision"], "KEEP_FOR_REVIEW")
+            self.assertEqual(suggestion["review"]["actor_id"], str(self.uid))
+            self.assertIsNone(run.results["CONTACT_SEARCH"]["selected_contact"])
+            self.assertEqual(run.status, "NEEDS_REVIEW")
+            self.assertEqual(list(db.scalars(select(Approval))), [])
+            job = db.scalar(select(Job).where(Job.run_id == rid, Job.kind == "CONTACT_SEARCH"))
+            self.assertEqual(job.history[-1]["code"], "SUGGESTION_REVIEWED")
+        self.assertEqual(self.drain(), [])
 
     def test_unqualified_model_contacts_do_not_discard_research(self):
         FixtureProviders.invalid_contact_roles = True
@@ -931,6 +1040,20 @@ class NativeTests(BackendFixtures):
         with Session() as db:
             self.assertEqual(db.get(PreparationRun, rid).status, "PENDING_APPROVAL")
 
+    def test_contact_retry_blocks_uncertain_parallel_request(self):
+        FixtureProviders.people = False
+        rid = self.prepare("contact-retry-uncertain")
+        self.drain()
+        with Session() as db:
+            job = db.scalar(select(Job).where(Job.run_id == rid, Job.kind == "CONTACT_SEARCH"))
+            self.assertEqual(job.status, "NEEDS_REVIEW")
+            db.add(ProviderUsage(workspace_id=self.wid, job_id=job.id, provider="PARALLEL", operation="uncertain-contact", status="UNCERTAIN", estimated_microusd=1000))
+            db.commit()
+        response = self.client.post(f"/workspaces/{self.wid}/preparation/{rid}/retry-contact-search", headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+        with Session() as db:
+            self.assertEqual(db.get(PreparationRun, rid).status, "NEEDS_REVIEW")
+
     def test_database_rejects_job_bound_to_different_lead_in_same_workspace(self):
         rid = self.prepare()
         with Session() as db:
@@ -968,18 +1091,16 @@ class NativeTests(BackendFixtures):
         response = httpx.Response(
             200,
             json={
-                "choices": [
-                    {"finish_reason": "stop", "message": {"content": '{"ok":true}'}}
-                ],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}],
             },
         )
         with patch.dict(
             os.environ,
             {
-                "MODEL_API_KEY": "fixture-only",
-                "MODEL_INPUT_USD_PER_MILLION": "1",
-                "MODEL_OUTPUT_USD_PER_MILLION": "1",
+                "PARALLEL_API_KEY": "fixture-only",
+                "PARALLEL_RESPONSE_USD_PER_REQUEST": "0.01",
+                "PARALLEL_MONTHLY_BUDGET_USD": "1",
                 "PROVIDER_MONTHLY_BUDGET_USD": "1",
             },
         ), patch(
@@ -999,24 +1120,73 @@ class NativeTests(BackendFixtures):
             )
             self.assertEqual(request.call_count, 1)
             self.assertEqual(
-                request.call_args.kwargs["json"]["response_format"],
-                {"type": "json_object"},
+                request.call_args.kwargs["json"]["model"],
+                "parallel",
             )
         with Session() as db:
             row = db.scalar(select(ProviderUsage))
             self.assertEqual(row.status, "SUCCESS")
-            self.assertEqual(row.usage["prompt_tokens"], 10)
+            self.assertEqual(row.provider, "PARALLEL")
         with patch.dict(os.environ, {"PROVIDER_MONTHLY_BUDGET_USD": "0"}):
             with self.assertRaises(ProviderFailure) as error:
                 provider.reserve("MODEL", "exhausted", 1)
             self.assertEqual(error.exception.code, "PROVIDER_BUDGET_EXHAUSTED")
+
+    def test_entity_budget_rejects_before_request(self):
+        self.prepare()
+        with Session() as db:
+            job = queue.claim(db)
+        provider = Providers(job, lambda value: None)
+        env = {"PARALLEL_API_KEY": "fixture-only", "PARALLEL_ENTITY_SEARCH_USD_PER_REQUEST": "0.005", "PARALLEL_MONTHLY_BUDGET_USD": "0.004", "PROVIDER_MONTHLY_BUDGET_USD": "1"}
+        with patch.dict(os.environ, env), patch("marketing_backend.providers.httpx.post") as post:
+            with self.assertRaises(ProviderFailure) as error:
+                provider.parallel_entity_search("entity-test", "Synthetic company")
+            self.assertEqual(error.exception.code, "PARALLEL_BUDGET_EXHAUSTED")
+            post.assert_not_called()
+
+    def test_uncertain_entity_failure_blocks_manual_retry(self):
+        self.prepare()
+        with Session() as db:
+            job = queue.claim(db)
+        provider = Providers(job, lambda value: None)
+        env = {"PARALLEL_API_KEY": "fixture-only", "PARALLEL_ENTITY_SEARCH_USD_PER_REQUEST": "0.005", "PARALLEL_MONTHLY_BUDGET_USD": "1", "PROVIDER_MONTHLY_BUDGET_USD": "1"}
+        with patch.dict(os.environ, env), patch("marketing_backend.providers.httpx.post", return_value=httpx.Response(503)):
+            with self.assertRaises(ProviderFailure):
+                provider.parallel_entity_search("entity-test", "Synthetic company")
+        with Session() as db:
+            queue.fail(db, job.id, job.lease_token, "SEARCH_UNAVAILABLE", retryable=True)
+        response = self.client.post(f"/workspaces/{self.wid}/jobs/{job.id}/retry", headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+        with Session() as db:
+            self.assertEqual(db.get(Job, job.id).failure_code, "PARALLEL_RECONCILIATION_REQUIRED")
+            self.assertEqual(db.scalar(select(ProviderUsage).where(ProviderUsage.job_id == job.id)).status, "UNCERTAIN")
+            # Jobs that failed before the reconciliation failure code existed
+            # must still be blocked by their durable usage record.
+            db.get(Job, job.id).failure_code = "SEARCH_UNAVAILABLE"
+            db.commit()
+        self.assertEqual(self.client.post(f"/workspaces/{self.wid}/jobs/{job.id}/retry", headers=self.headers).status_code, 409)
+
+    def test_expired_entity_reservation_requires_reconciliation(self):
+        self.prepare()
+        with Session() as db:
+            job = queue.claim(db)
+        provider = Providers(job, lambda value: None)
+        with patch.dict(os.environ, {"PARALLEL_MONTHLY_BUDGET_USD": "1", "PROVIDER_MONTHLY_BUDGET_USD": "1"}):
+            provider.reserve("PARALLEL", "contact-entities-v2", 5000)
+        with Session() as db:
+            db.get(Job, job.id).lease_until = now() - timedelta(seconds=1)
+            db.commit()
+            queue.recover_expired(db)
+        with Session() as db:
+            self.assertEqual(db.get(Job, job.id).failure_code, "PARALLEL_RECONCILIATION_REQUIRED")
+            self.assertEqual(db.scalar(select(ProviderUsage).where(ProviderUsage.job_id == job.id)).status, "UNCERTAIN")
 
     def test_provider_configuration_and_throttling_stop_before_extra_calls(self):
         self.provider.stop()
         rid = self.prepare()
         with Session() as db:
             job = queue.claim(db)
-        with patch.dict(os.environ, {"MODEL_API_KEY": ""}), patch(
+        with patch.dict(os.environ, {"PARALLEL_API_KEY": ""}), patch(
             "marketing_backend.providers.httpx.post"
         ) as model, patch("marketing_backend.stages.fetch_public") as fetch:
             execute(job)
@@ -1042,16 +1212,16 @@ class NativeTests(BackendFixtures):
         provider = Providers(job, save)
         with patch.dict(
             os.environ,
-            {"BRAVE_SEARCH_API_KEY": "fixture-only", "SEARCH_USD_PER_REQUEST": "0.01"},
+            {"PARALLEL_API_KEY": "fixture-only", "PARALLEL_SEARCH_USD_PER_REQUEST": "0.001", "PARALLEL_MONTHLY_BUDGET_USD": "32"},
         ), patch(
-            "marketing_backend.providers.httpx.get", return_value=httpx.Response(429)
+            "marketing_backend.providers.httpx.post", return_value=httpx.Response(429)
         ) as request:
             with self.assertRaises(ProviderFailure) as error:
                 provider.search("rate-limited", "Synthetic company query")
             self.assertTrue(error.exception.retryable)
             self.assertEqual(request.call_count, 1)
             self.assertEqual(
-                request.call_args.kwargs["headers"]["Accept"], "application/json"
+                request.call_args.kwargs["headers"]["x-api-key"], "fixture-only"
             )
         with Session() as db:
             self.assertEqual(db.scalar(select(ProviderUsage)).status, "REJECTED")

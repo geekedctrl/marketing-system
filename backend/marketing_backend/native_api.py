@@ -56,8 +56,21 @@ class DiscoveryRequest(Request):
 
 class ContactChoice(Strict):
     person_index: int | None = Field(default=None, ge=0, le=4, strict=True)
+    suggestion_index: int | None = Field(default=None, ge=0, le=4, strict=True)
+    suggestion_name: str | None = Field(default=None, min_length=3, max_length=150)
+    suggestion_url: str | None = Field(default=None, min_length=8, max_length=1500)
+    email_candidate_index: int | None = Field(default=None, ge=0, le=4, strict=True)
+    email_candidate_value: str | None = Field(default=None, min_length=3, max_length=254)
+    email_candidate_source: str | None = Field(default=None, min_length=8, max_length=1500)
     profile_url: str | None = Field(default=None, max_length=1500)
     business_contact: Person | None = None
+
+
+class SuggestionReview(Strict):
+    decision: Literal["KEEP_FOR_REVIEW", "REJECTED", "UNRESOLVED"]
+    note: str = Field(min_length=5, max_length=1000)
+    suggestion_name: str = Field(min_length=3, max_length=150)
+    suggestion_url: str = Field(min_length=8, max_length=1500)
 
 
 class Decision(Strict):
@@ -331,6 +344,47 @@ def run(wid: UUID, rid: UUID, actor=Depends(user), db=Depends(session)):
 
 
 @router.post(
+    "/preparation/{rid}/suggestions/{suggestion_index}/review",
+    status_code=202,
+    response_model=out.PreparationContinued,
+)
+def review_suggestion(wid: UUID, rid: UUID, suggestion_index: int, data: SuggestionReview,
+                      actor=Depends(user), db=Depends(session)):
+    scope(wid, actor, db, ["ADMIN", "OPERATOR"])
+    contact_job = db.scalar(select(Job).where(Job.workspace_id == wid, Job.run_id == rid,
+                            Job.kind == "CONTACT_SEARCH").with_for_update())
+    workspace_lock(db, wid)
+    item = run_for(db, wid, rid)
+    if item.status != "NEEDS_REVIEW" or item.stop_reason not in ("SUPPORTED_CONTACT_REQUIRED", "CONTACT_SEARCH_UNAVAILABLE"):
+        raise HTTPException(409, "Run is not waiting for contact review")
+    if not enabled(db, item) or fingerprint(for_run(db, item)) != item.context_hash:
+        raise HTTPException(409, "Resume product or start fresh preparation after context changes")
+    result = dict(item.results.get("CONTACT_SEARCH") or {})
+    suggestions = list(result.get("suggestions") or [])
+    if suggestion_index < 0 or suggestion_index >= len(suggestions):
+        raise HTTPException(422, "Select a saved suggestion")
+    suggestion = dict(suggestions[suggestion_index])
+    if (data.suggestion_name, data.suggestion_url) != (suggestion.get("name"), suggestion.get("url")):
+        raise HTTPException(409, "Suggestions changed; refresh and review again")
+    if suggestion.get("status") != "UNVERIFIED":
+        raise HTTPException(422, "This action is for unverified suggestions")
+    review = {"decision": data.decision, "note": data.note, "actor_id": str(actor.id), "at": now().isoformat()}
+    suggestion["review"] = review
+    suggestions[suggestion_index] = suggestion
+    result["suggestions"] = suggestions
+    item.results = {**item.results, "CONTACT_SEARCH": result}
+    if contact_job:
+        contact_job.result = result
+        contact_job.history = [*contact_job.history, {"code": "SUGGESTION_REVIEWED", **review,
+            "suggestion_name": suggestion["name"], "suggestion_url": suggestion["url"]}]
+        if item.snapshot.get("product_line"):
+            from .human_artifacts import contact_resolution
+            contact_resolution(db, contact_job, item, actor.id, result)
+    db.commit()
+    return {"run_id": item.id, "status": item.status}
+
+
+@router.post(
     "/preparation/{rid}/contact",
     status_code=202,
     response_model=out.PreparationContinued,
@@ -359,7 +413,9 @@ def contact(
             409, "Resume product or start fresh preparation after context changes"
         )
     people = item.results.get("CONTACT_SEARCH", {}).get("people", [])
-    if (data.person_index is None) == (data.business_contact is None):
+    if data.email_candidate_index is not None and data.suggestion_index is None:
+        raise HTTPException(422, "Select an email with its saved suggestion")
+    if sum(v is not None for v in (data.person_index, data.suggestion_index, data.business_contact)) != 1:
         raise HTTPException(
             422, "Select a researched person or enter a source-backed business contact"
         )
@@ -388,6 +444,31 @@ def contact(
                 "Name, role and business email must be supported by the saved quote",
             )
         selected.update(profiles=[], profile_candidates=[])
+    elif data.suggestion_index is not None:
+        suggestions = item.results.get("CONTACT_SEARCH", {}).get("suggestions", [])
+        if data.suggestion_index >= len(suggestions):
+            raise HTTPException(422, "Select a saved suggestion")
+        suggestion = suggestions[data.suggestion_index]
+        if (data.suggestion_name, data.suggestion_url) != (suggestion.get("name"), suggestion.get("url")):
+            raise HTTPException(409, "Suggestions changed; refresh and select again")
+        if suggestion.get("status") != "SUPPORTED" or not suggestion.get("role") or not suggestion.get("evidence"):
+            raise HTTPException(422, "This suggestion needs evidence before selection")
+        citation = suggestion["evidence"][0]
+        selected = {"name": suggestion["name"], "role": suggestion["role"], "email": None, "phone": None,
+                    "source_url": citation["source_url"], "evidence_quote": citation["evidence_quote"],
+                    "profiles": [], "profile_candidates": []}
+        if data.email_candidate_index is not None:
+            if item.snapshot.get("product_line") and (not contact_job or (contact_job.task_envelope or {}).get("schema_version", 0) < 3):
+                raise HTTPException(409, "Start a new contact search to preserve email evidence")
+            candidates = suggestion.get("email_candidates", [])
+            if data.email_candidate_index >= len(candidates):
+                raise HTTPException(409, "Email candidates changed; refresh and select again")
+            candidate = candidates[data.email_candidate_index]
+            if (data.email_candidate_value, data.email_candidate_source) != (candidate.get("email"), candidate.get("source_url")):
+                raise HTTPException(409, "Email candidates changed; refresh and select again")
+            if candidate.get("status") != "PUBLICLY_SOURCED_UNVERIFIED":
+                raise HTTPException(422, "Email evidence is not available for review")
+            selected["email"] = candidate["email"]
     else:
         if data.person_index >= len(people):
             raise HTTPException(422, "Select a saved researched person")
@@ -406,9 +487,10 @@ def contact(
         selected["profiles"] = [
             p for p in selected["profiles"] if p["platform"] != "linkedin.com"
         ] + [match]
-    if not selected.get("email") and not any(
+    has_channel = bool(selected.get("email") or any(
         p["platform"] == "linkedin.com" for p in selected["profiles"]
-    ):
+    ))
+    if not has_channel and data.suggestion_index is None:
         raise HTTPException(422, "Selected person has no supported outreach channel")
     selected["human_review"] = {"actor_id": str(actor.id), "at": now().isoformat()}
     item.results = {
@@ -416,12 +498,17 @@ def contact(
         "CONTACT_SEARCH": {
             **item.results["CONTACT_SEARCH"],
             "selected_contact": selected,
-            "stop_reason": None,
+            "stop_reason": None if has_channel else "SUPPORTED_CONTACT_REQUIRED",
         },
     }
     if contact_job and item.snapshot.get("product_line"):
         from .human_artifacts import contact_resolution
         contact_resolution(db,contact_job,item,actor.id,item.results["CONTACT_SEARCH"])
+    if not has_channel:
+        if contact_job:
+            contact_job.result = item.results["CONTACT_SEARCH"]
+        db.commit()
+        return {"run_id": item.id, "status": item.status}
     item.status, item.stop_reason = "PREPARING", None
     if contact_job:
         previous_reason = contact_job.failure_code
@@ -489,9 +576,19 @@ def retry_contacts(wid: UUID, rid: UUID, actor=Depends(user), db=Depends(session
         raise HTTPException(
             409, "Resume product or start fresh preparation after context changes"
         )
-    if item.snapshot.get("product_line"):
-        if job.output_generation>=3:raise HTTPException(409,"Contact retry limit reached; start fresh work")
-        job.output_generation+=1
+    checkpoint = job.checkpoint or {}
+    usages = db.scalars(select(ProviderUsage).where(
+        ProviderUsage.workspace_id == wid, ProviderUsage.job_id == job.id,
+        ProviderUsage.provider == "PARALLEL", ProviderUsage.status.in_(("RESERVED", "UNCERTAIN", "SUCCESS")),
+    ))
+    if any(usage.status != "SUCCESS" or not any(
+        prefix + usage.operation in checkpoint for prefix in
+        ("parallel-search:", "parallel-model:", "parallel-identity:", "parallel-entity:")
+    ) for usage in usages):
+        raise HTTPException(409, "Reconcile the uncertain Parallel request before retrying")
+    if job.output_generation >= 3:
+        raise HTTPException(409, "Contact retry limit reached; start fresh work")
+    job.output_generation += 1
     item.status, item.stop_reason = "PREPARING", None
     job.status, job.failure_code = "PENDING", None
     job.attempts = 0

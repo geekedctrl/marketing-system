@@ -53,6 +53,7 @@ class EvaluatedDomain(Strict):
     ownership_reason: str | None = Field(default=None, max_length=100)
     ownership_evidence: list[OwnershipEvidence] = Field(default_factory=list, max_length=2)
     ownership_evidence_digest: str | None = Field(default=None, max_length=64)
+    identity_proposal: dict[str, Any] | None = None
 
 
 class DiscoveryCounts(Strict):
@@ -155,8 +156,11 @@ def store_output(db, job, result):
     else:
         if value.contract_name == "content.output" and value.schema_version == 2:
             result = {**result, "asset_type": "EMAIL_TEXT" if result.get("channel") == "EMAIL" else "SOCIAL_TEXT"}
+        payload = result
+        if value.contract_name == "contact.output" and value.schema_version < 3:
+            payload = {key: item for key, item in result.items() if key != "suggestions"}
         key = "result" if job.output_generation == 0 else "result:"+str(job.output_generation)
-        outputs = [(key, validate_payload(value.contract_name, value.schema_version, result))]
+        outputs = [(key, validate_payload(value.contract_name, value.schema_version, payload))]
     for key, output in outputs:
         evidence = evidence_refs(output)
         strategies = {"worker": IMPLEMENTATION}

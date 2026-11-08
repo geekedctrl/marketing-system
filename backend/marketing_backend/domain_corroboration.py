@@ -188,6 +188,8 @@ def corroborate(company_name, website, company_quote, providers, fetch_page, cou
 
 def valid_saved_evidence(candidate):
     """Re-evaluate saved evidence and digest before human acceptance."""
+    if candidate.get("verification_state") == "PROPOSED":
+        return valid_parallel_proposal(candidate)
     if candidate.get("verification_state") != "CORROBORATED":
         return False
     company = candidate.get("company_name", "")
@@ -226,3 +228,31 @@ def valid_saved_evidence(candidate):
         valid = True
     expected = evidence_digest(company, website, company_quote, evidence)
     return valid and candidate.get("ownership_evidence_digest") == expected
+
+
+def valid_parallel_proposal(candidate):
+    """Validate a cited AI proposal; the human acceptance remains the decision."""
+    proposal = candidate.get("identity_proposal")
+    if not isinstance(proposal, dict) or proposal.get("assessment") not in {"SUPPORTED", "UNCERTAIN", "CONFLICTING"}:
+        return False
+    company, website = candidate.get("company_name", ""), candidate.get("website", "")
+    sources = proposal.get("sources")
+    if (not isinstance(company, str) or not company or not isinstance(proposal.get("company_name"), str)
+            or not normalize(proposal["company_name"])
+            or not isinstance(sources, list) or not 1 <= len(sources) <= 10):
+        return False
+    try:
+        checked_url(website)
+        checked_url(candidate.get("source_url", ""))
+        checked_url(proposal.get("official_website", ""))
+        for source in sources:
+            checked_url(source)
+    except (FetchError, ValueError, TypeError):
+        return False
+    if not domain(website) or domain(candidate["source_url"]) != domain(website):
+        return False
+    if proposal["assessment"] == "SUPPORTED" and domain(website) != domain(proposal["official_website"]):
+        return False
+    payload = {"company_name": company, "website": website, "evidence_quote": candidate.get("evidence_quote"), "identity_proposal": proposal}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    return candidate.get("identity_digest") == digest

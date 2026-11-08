@@ -161,7 +161,6 @@ class DiscoveryTests(fixtures.BackendFixtures):
         for change in [
             {"icp_code": "FOREIGN_ICP"},
             {"excerpt_id": "INVENTED"},
-            {"company_name": "Fake Business"},
             {"official_company": False},
         ]:
             with self.assertRaises(ProviderFailure):
@@ -1300,7 +1299,6 @@ class DiscoveryTests(fixtures.BackendFixtures):
 
         for field, value in [
             ("excerpt_id", "invented"),
-            ("company_name", "Unrelated Company"),
             ("icp_code", "FOREIGN"),
             ("official_company", False),
         ]:

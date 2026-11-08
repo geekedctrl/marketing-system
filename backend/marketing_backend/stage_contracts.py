@@ -13,8 +13,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, JsonValue, field_validator, model_validator
 
-CURRENT_VERSION = 3
-SUPPORTED_VERSIONS = (1, 2, 3)
+CURRENT_VERSION = 4
+SUPPORTED_VERSIONS = (1, 2, 3, 4)
 Stage = Literal["SETUP", "DISCOVERY", "RESEARCH", "CONTACT_SEARCH", "SCORING", "MATCHING", "DRAFTING"]
 Hash = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Code = Annotated[str, Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.:-]+$")]
@@ -36,7 +36,7 @@ class Strict(BaseModel):
 class ArtifactReference(Strict):
     artifact_id: UUID
     contract_name: Code
-    schema_version: int = Field(ge=1, le=3)
+    schema_version: int = Field(ge=1, le=4)
     content_hash: Hash
 
 
@@ -231,6 +231,19 @@ class DiscoveryCandidateV3(DiscoveryCandidateV2):
         return self
 
 
+class DiscoveryCandidateV4(DiscoveryCandidateV2):
+    verification_state: Literal["PROPOSED"]
+    identity_proposal: dict[str, JsonValue]
+    identity_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def proposal_integrity(self):
+        from .domain_corroboration import valid_parallel_proposal
+        if not valid_parallel_proposal(self.model_dump(mode="json")):
+            raise ValueError("invalid identity proposal")
+        return self
+
+
 class Finding(Citation):
     category: Literal["COMPANY", "INDUSTRY", "SERVICES", "FLEET", "TECHNOLOGY", "LOCATION", "PAIN_POINT", "SIGNAL"]
     statement: str = Field(min_length=8, max_length=1000)
@@ -375,6 +388,37 @@ class ContactV2(ContactResult, WithSources):
     pass
 
 
+class SuggestionReview(Strict):
+    decision: Literal["KEEP_FOR_REVIEW", "REJECTED", "UNRESOLVED"]
+    note: str = Field(min_length=5, max_length=1000)
+    actor_id: UUID
+    at: str = Field(min_length=10, max_length=80)
+
+
+class PublicEmailCandidate(Strict):
+    email: str = Field(min_length=3, max_length=254)
+    source_url: str = Field(min_length=8, max_length=1500)
+    evidence_quote: str = Field(min_length=8, max_length=500)
+    observed_at: str = Field(min_length=10, max_length=80)
+    status: Literal["PUBLICLY_SOURCED_UNVERIFIED"]
+
+
+class ContactSuggestion(Strict):
+    name: str = Field(min_length=3, max_length=150)
+    description: str = Field(max_length=2000)
+    url: str = Field(max_length=1500)
+    role: str | None = Field(default=None, max_length=200)
+    evidence: list[Citation] = Field(default_factory=list, max_length=5)
+    status: Literal["SUPPORTED", "UNVERIFIED"]
+    uncertainty: str = Field(max_length=1000)
+    review: SuggestionReview | None = None
+    email_candidates: list[PublicEmailCandidate] = Field(default_factory=list, max_length=5)
+
+
+class ContactV3(ContactV2):
+    suggestions: list[ContactSuggestion] = Field(default_factory=list, max_length=5)
+
+
 class ScoreV2(ScoreResult, WithSources):
     pass
 
@@ -395,12 +439,14 @@ SCHEMAS = {
     ("discovery.candidate", 1): DiscoveryCandidateV1,
     ("discovery.candidate", 2): DiscoveryCandidateV2,
     ("discovery.candidate", 3): DiscoveryCandidateV3,
+    ("discovery.candidate", 4): DiscoveryCandidateV4,
     ("research.output", 1): ResearchOutputV1,
     ("research.output", 2): ResearchOutputV2,
 }
 for _name, _v1, _v2 in (("setup.output", SetupResult, SetupV2), ("contact.output", ContactResult, ContactV2),
     ("scoring.output", ScoreResult, ScoreV2), ("matching.output", MatchResult, MatchV2), ("content.output", ContentResult, ContentV2)):
     SCHEMAS[_name, 1], SCHEMAS[_name, 2] = _v1, _v2
+SCHEMAS["contact.output", 3] = ContactV3
 
 
 def canonical_json(value):
